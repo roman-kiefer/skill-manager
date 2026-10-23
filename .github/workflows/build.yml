@@ -1,0 +1,125 @@
+name: Build and release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]*.[0-9]*.[0-9]*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ github.ref_name }}
+
+jobs:
+  version:
+    name: Validate stable version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require vMAJOR.MINOR.PATCH
+        shell: bash
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Only stable version tags such as v1.2.3 are supported."
+            exit 1
+          fi
+
+  build:
+    needs: version
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    defaults:
+      run:
+        shell: bash
+    env:
+      CGO_ENABLED: '0'
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Test (including temporary executable update)
+        run: go test ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build and package
+        id: package
+        run: |
+          set -euo pipefail
+          target="$(go env GOOS)-$(go env GOARCH)"
+          binary=skill-manager
+          if [[ "$(go env GOOS)" == windows ]]; then binary=skill-manager.exe; fi
+          package="skill-manager-${target}"
+          mkdir -p "dist/${package}"
+          go build -trimpath -ldflags="-s -w -X main.version=${RELEASE_TAG}" -o "dist/${package}/${binary}" .
+          test "$("dist/${package}/${binary}" --version)" = "skill-manager ${RELEASE_TAG}"
+          cp README.md LICENSE "dist/${package}/"
+          tar -czf "dist/${package}.tar.gz" -C dist "${package}"
+          echo "name=${package}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload release package
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: dist/${{ steps.package.outputs.name }}.tar.gz
+          archive: false
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Publish complete release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Download all packages
+        uses: actions/download-artifact@v8
+        with:
+          pattern: skill-manager-*
+          path: packages
+          merge-multiple: true
+
+      - name: Publish only after all packages exist
+        working-directory: packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          archives=(skill-manager-*.tar.gz)
+          test "${#archives[@]}" -eq 3
+          sha256sum "${archives[@]}" > SHA256SUMS
+          if draft="$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)"; then
+            if [[ "$draft" != true ]]; then
+              echo "Release already published; refusing to replace its files."
+              exit 1
+            fi
+          else
+            gh release create "$RELEASE_TAG" --verify-tag --draft --title "$RELEASE_TAG" --generate-notes
+          fi
+          gh release upload "$RELEASE_TAG" "${archives[@]}" SHA256SUMS --clobber
+          gh release edit "$RELEASE_TAG" --draft=false
